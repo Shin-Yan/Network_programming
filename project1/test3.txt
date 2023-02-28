@@ -1,0 +1,6 @@
+   1 bin
+   2 builtins.c
+   3 builtins.h
+   4 main.c
+   5 npshell
+   6 test.html
