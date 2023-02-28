@@ -6,7 +6,7 @@
 #include <string.h>
 #include <fcntl.h>
 
-#include "builtins.h"
+#include "simple_builtins.h"
 
 #define MAX_LEN 15000
 #define MYSH_TOKEN_DELIM " \t\n\r"
@@ -18,7 +18,7 @@ char *builtin_str[] = {
   "exit"
 };
 
-int mysh_printenv(char **args)
+int mysh_printenv(char **args, int sockfd)
 {
     char *var;
     if(args[1] == NULL)
@@ -26,23 +26,23 @@ int mysh_printenv(char **args)
     else if(args[2])
       return 1;
     var = getenv(args[1]);
+    strcat(var,"\n");
     if(var)
-      printf("%s\n",var);
+      write(sockfd,var,strlen(var));
     return 1;
 }
 
-int mysh_setenv(char **args)
+int mysh_setenv(char **args,int sockfd)
 {
     setenv(args[1],args[2],1);
     return 1;
 }
 
-int mysh_exit(char **args)
+int mysh_exit(char **args,int sockfd)
 {
   return 0;
 }
-
-int (*builtin_func[]) (char **) = {
+int (*builtin_func[]) (char **,int) = {
   &mysh_printenv,
   &mysh_setenv,
   &mysh_exit
@@ -52,12 +52,13 @@ int mysh_num_builtins() {
   return sizeof(builtin_str) / sizeof(char *);
 }
 
-char* mysh_read_line(void)
+char* mysh_read_line(int sockfd)
 {
   char *line = NULL;
   ssize_t bufsize = 0; // have getline allocate a buffer for us
-  if (getline(&line, &bufsize, stdin) == -1) {
-    if (feof(stdin)){
+  FILE *CLIENT_IN = fdopen(sockfd,"r"); 
+  if (getline(&line, &bufsize, CLIENT_IN) == -1) {
+    if (feof(CLIENT_IN)){
       exit(EXIT_SUCCESS);  // We received an EOF
     } 
     else{
@@ -68,7 +69,7 @@ char* mysh_read_line(void)
   return line;
 }
 
-int mysh_file_redirection(int in,cmd_struct* cmd,char* filename){
+int mysh_file_redirection(int in,cmd_struct* command,char* filename,int sockfd){
   pid_t pid;
   int status;
 
@@ -82,23 +83,26 @@ int mysh_file_redirection(int in,cmd_struct* cmd,char* filename){
     if ((fd = creat(filename, S_IRUSR | S_IWUSR)) < 0)
       perror("creat() error");
     dup2(fd, STDOUT_FILENO);
+    dup2(sockfd,STDERR_FILENO);
     close(fd);
-    if (execvp(cmd->args[0], cmd->args) == -1) {
-      printf("Unknown command: [%s].\n",cmd->args[0]);
+    if (execvp(command->args[0], command->args) == -1) {
+      //printf("Unknown command: [%s].\n",cmd->args[0]);
+        char errstr[300] = "Unknown command: [";
+        char errstr2[100] = "].\n";
+        strcat(errstr,command->progname);
+        strcat(errstr,errstr2);
+        write(STDERR_FILENO,errstr,strlen(errstr));
     }
     exit(EXIT_FAILURE);
   } else if (pid < 0) {
-    perror("fork");
+    return mysh_file_redirection(in,command,filename,sockfd);
   } else {
-    signal(SIGCHLD,sig_handler);
-    // do {
-    //   waitpid(pid, &status, WUNTRACED);
-    // } while (!WIFEXITED(status) && !WIFSIGNALED(status));
+    waitpid(pid, &status, WUNTRACED);
   }
   return 1;
 }
 
-int mysh_execute(pipeline_struct* pipeline,int** numberpipe_table){
+int mysh_execute(pipeline_struct* pipeline,int** numberpipe_table,int sockfd){
   int zero_index = -1;
   int n = pipeline->n_cmds;
   int i=0;
@@ -106,27 +110,23 @@ int mysh_execute(pipeline_struct* pipeline,int** numberpipe_table){
   int in,fd[2];
   if (pipeline->cmds[0]->args[0]==NULL)
     return 1;
+  // printf("the command is %s\n",pipeline->cmds[0]->args[0]);
+  // fflush(stdout);
   for(int i=0 ; i<1000 ; i++){
       if(numberpipe_table[0][i] > 0)
         numberpipe_table[0][i]--;
       if(numberpipe_table[0][i] == 0)
         zero_index = i;
     }
-  // printf("zero index = %d\n",zero_index);
   for (int j = 0; j < mysh_num_builtins(); j++) {
     if (strcmp(pipeline->cmds[i]->args[0], builtin_str[j]) == 0) {
-      return (*builtin_func[j])(pipeline->cmds[i]->args);
+      return (*builtin_func[j])(pipeline->cmds[i]->args,sockfd);
     }
   }
-  // printf("zero_index is %d\n",zero_index);
-  // printf("zero_fd are %d, %d and %d\n",numberpipe_table[0][zero_index],numberpipe_table[1][zero_index],numberpipe_table[2][zero_index]);
+  
   if(zero_index == -1)
     in = STDIN_FILENO;
-    // printf("number pipe in\n");
-    
   else{
-    // printf("zero_fd are %d, %d and %d\n",numberpipe_table[0][zero_index],numberpipe_table[1][zero_index],numberpipe_table[2][zero_index]);
-
     numberpipe_table[0][zero_index]--;
     in = numberpipe_table[1][zero_index];
     close(numberpipe_table[2][zero_index]);
@@ -134,18 +134,21 @@ int mysh_execute(pipeline_struct* pipeline,int** numberpipe_table){
     
   for(i = 0; i < n-1; ++i){
     if(pipeline->pipes_and_FR[i]=='>'){
-      return mysh_file_redirection(in,pipeline->cmds[i],pipeline->cmds[i+1]->args[0]);
+      return mysh_file_redirection(in,pipeline->cmds[i],pipeline->cmds[i+1]->args[0],sockfd);
     }
     pipe(fd);
     if((pipeline->numberpiped==1) &&(i == n-2)){
-      // printf("pipetype: %c\n",pipeline->pipes_and_FR[n-2]);
-      return mysh_number_pipe(pipeline->cmds[n-2],in,fd[0],fd[1],pipeline->pipes_and_FR[n-2],pipeline->cmds[n-1]->args[0],numberpipe_table);
+      return mysh_number_pipe(pipeline->cmds[n-2],in,fd[0],fd[1],pipeline->pipes_and_FR[n-2],pipeline->cmds[n-1]->args[0],numberpipe_table,sockfd);
     }
-    mysh_launch(in,fd[1],pipeline->cmds[i]);
+    mysh_launch(in,fd[1],pipeline->cmds[i],0,sockfd);
+    if(in!=STDIN_FILENO)
+      close(in);
     close(fd[1]);
     in = fd[0];
   }
-  mysh_launch(in,STDOUT_FILENO,pipeline->cmds[n-1]);
+  mysh_launch(in,sockfd,pipeline->cmds[n-1],1,sockfd);
+  if(in != STDIN_FILENO)
+    close(in);
   return 1;
 }
 int search(int** table, int num){
@@ -157,14 +160,47 @@ int search(int** table, int num){
 }
 
 void sig_handler(int num){
-  // int status;
-    // do {
       wait(NULL);
-    // } while (!WIFEXITED(status) && !WIFSIGNALED(status));
 }
 
+int mysh_launch(int in,int out,cmd_struct* command,int last,int sockfd)
+{
+  pid_t pid;
+  int status;
 
-int mysh_number_pipe(cmd_struct* command,int in,int read,int writer, char symbol, char* number, int** table){
+  while((pid = fork())<0){
+    ;
+  }
+    if (pid == 0) {
+      if(in != STDIN_FILENO){
+        dup2(in,STDIN_FILENO);
+        close(in);
+      }
+      if(out != STDOUT_FILENO){
+        dup2(out,STDOUT_FILENO);
+        if(out!=sockfd)
+          close(out);
+      }
+      dup2(sockfd,STDERR_FILENO);
+      if (execvp(command->args[0],command->args) == -1) {
+          char errstr[300] = "Unknown command: [";
+          char errstr2[100] = "].\n";
+          strcat(errstr,command->progname);
+          strcat(errstr,errstr2);
+          write(STDERR_FILENO,errstr,strlen(errstr));
+      }
+      exit(EXIT_FAILURE);
+    } 
+    else {
+      if(last == 0)
+        signal(SIGCHLD,sig_handler);
+      else
+        waitpid(pid, &status, WUNTRACED);
+    }
+  return 1;
+}
+
+int mysh_number_pipe(cmd_struct* command,int in,int read,int writer, char symbol, char* number, int** table,int sockfd){
   int pipe_number = atoi(number);
   int pipe_index;
   pid_t pid;
@@ -181,6 +217,8 @@ int mysh_number_pipe(cmd_struct* command,int in,int read,int writer, char symbol
       dup2(writer,STDOUT_FILENO);
       if(symbol == '!')
         dup2(writer,STDERR_FILENO);
+      else
+        dup2(sockfd,STDERR_FILENO);
       if (execvp(command->args[0],command->args) == -1) {
         // printf("Unknown command: [%s].\n",command->progname);
         char errstr[300] = "Unknown command: [";
@@ -192,18 +230,14 @@ int mysh_number_pipe(cmd_struct* command,int in,int read,int writer, char symbol
       exit(EXIT_FAILURE);
     }
     else if(pid<0){
-      perror("fork");
+      return mysh_number_pipe(command,in,read,writer,symbol,number,table,sockfd);
     }
     else{
       signal(SIGCHLD,sig_handler);
-    // do {
-    //   waitpid(pid, &status, WUNTRACED);
-    // } while (!WIFEXITED(status) && !WIFSIGNALED(status));
       table[0][pipe_index] = pipe_number;
       table[1][pipe_index] = read;
       table[2][pipe_index] = writer;
     }
-    // printf("woo hooo\n");
   }
   else{
     pid = fork();
@@ -215,8 +249,9 @@ int mysh_number_pipe(cmd_struct* command,int in,int read,int writer, char symbol
       dup2(table[2][pipe_index],STDOUT_FILENO);
       if(symbol == '!')
         dup2(table[2][pipe_index],STDERR_FILENO);
+      else
+        dup2(sockfd,STDERR_FILENO);
       if (execvp(command->args[0],command->args) == -1) {
-        // printf("Unknown command: [%s].\n",command->progname);
         char errstr[300] = "Unknown command: [";
         char errstr2[100] = "].\n";
         strcat(errstr,command->progname);
@@ -226,57 +261,14 @@ int mysh_number_pipe(cmd_struct* command,int in,int read,int writer, char symbol
       exit(EXIT_FAILURE);
     }
     else if(pid<0){
-      perror("fork");
+      return mysh_number_pipe(command,in,read,writer,symbol,number,table,sockfd);
     }
     else{
       signal(SIGCHLD,sig_handler);
-    // do {
-    //   waitpid(pid, &status, WUNTRACED);
-    // } while (!WIFEXITED(status) && !WIFSIGNALED(status));
       close(read);
       close(writer);
     }
-    // printf("woo hooo\n");
   }
-  return 1;
-}
-
-int mysh_launch(int in,int out,cmd_struct* command)
-{
-  pid_t pid;
-  int status;
-
-  pid = fork();
-  if (pid == 0) {
-    
-    if(in != STDIN_FILENO){
-      dup2(in,STDIN_FILENO);
-      close(in);
-    }
-    if(out != STDOUT_FILENO){
-      dup2(out,STDOUT_FILENO);
-      close(out);
-    }
-    if (execvp(command->args[0],command->args) == -1) {
-        // printf("Unknown command: [%s].\n",command->progname);
-        char errstr[300] = "Unknown command: [";
-        char errstr2[100] = "].\n";
-        strcat(errstr,command->progname);
-        strcat(errstr,errstr2);
-        write(STDERR_FILENO,errstr,strlen(errstr));
-    }
-    exit(EXIT_FAILURE);
-  } 
-  else if (pid < 0) {
-    perror("fork");
-  } 
-  else {
-    signal(SIGCHLD,sig_handler);
-    // do {
-    //   waitpid(pid, &status, WUNTRACED);
-    // } while (!WIFEXITED(status) && !WIFSIGNALED(status));
-  }
-  // printf("woo hooo!\n");
   return 1;
 }
 
@@ -324,7 +316,6 @@ pipeline_struct* mysh_parse_pipeline(char* str){
   while((cmd_str = strsep(&copy, "|!>"))) {
     ret->cmds[i++] = mysh_parse_command(cmd_str);
   }
-  // print_pipeline(ret);
   return ret;
 }
 

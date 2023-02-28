@@ -24,11 +24,14 @@ void mysh_loop(void)
   }
   do {
     // printf("in the new loop!\n");
+    
     printf("%% ");
     line = mysh_read_line();
     
     pipeline = mysh_parse_pipeline(line);
     status = mysh_execute(pipeline,mysh_numberpipe_table);
+    if(pipeline->numberpiped == 0)
+      wait(NULL);
     free(line);
     free(pipeline);
   } while (status);
